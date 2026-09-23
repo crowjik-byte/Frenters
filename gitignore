@@ -1,0 +1,12 @@
+# Credentials -- never commit
+.env
+.streamlit/secrets.toml
+
+# Local JSON storage (dev backend)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
