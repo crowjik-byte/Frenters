@@ -51,6 +51,30 @@ def get_store():
     return store.get_storage(dsn=_secret("DATABASE_URL"))
 
 
+def storage_mode():
+    """
+    Which backend is actually in use -- ("postgres"|"json", detail).
+
+    This exists because the fallback used to be silent, and a silently
+    ephemeral app is indistinguishable from a working one right up until a
+    redeploy takes everything with it. Surfaced in the sidebar, and
+    banner-loud when it matters.
+    """
+    db = get_store()
+    if isinstance(db, store.PostgresStorage):
+        host = db.dsn.split("@")[-1].split("/")[0] if "@" in db.dsn else "configured"
+        return "postgres", host
+    return "json", getattr(db, "root", "./data")
+
+
+def secret_keys_seen():
+    """Names only, never values -- for telling a missing key from a nested one."""
+    try:
+        return sorted(st.secrets.keys())
+    except Exception:
+        return []
+
+
 def _gkey(base):
     """Widget key carrying a generation counter -- bump to remount fresh."""
     gen = st.session_state.get(f"_gen_{base}", 0)
@@ -869,6 +893,24 @@ def main():
     # --- full app ---
     with st.sidebar:
         st.markdown(f"**{participant['display_name']}**")
+        mode, detail = storage_mode()
+        if mode == "postgres":
+            st.caption(f"Saving to {detail}")
+        else:
+            st.warning("Not saving to a database")
+            with st.expander("Why this matters"):
+                st.markdown(
+                    f"Writing to `{detail}` on this machine. On Streamlit "
+                    "Community Cloud that directory is erased on every redeploy, "
+                    "restart, or sleep — dialogues and saved agents will disappear "
+                    "without warning.\n\n"
+                    "`DATABASE_URL` was not found. It must be a **top-level** key "
+                    "in secrets — a key under any `[section]` header will not be "
+                    "seen."
+                )
+                keys = secret_keys_seen()
+                st.caption("Top-level secret keys currently visible: "
+                           + (", ".join(f"`{k}`" for k in keys) if keys else "*none*"))
         dialogues = db.list_dialogues(created_by=participant["id"])
         options = ["＋ New dialogue"] + [d["title"] for d in dialogues] + ["Agent library"]
         current = 0
