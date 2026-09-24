@@ -31,20 +31,50 @@ not guarantee persistence of local files and may delete them at any time.
 
 ## Moving to Postgres
 
+Get the connection string from your provider's dashboard (on Neon: **Connect**
+on the Project Dashboard). You want **two** versions of it — they differ only
+in the hostname:
+
+- **Pooled** (`-pooler` in the host) → `DATABASE_URL` for the running app.
+  `PostgresStorage` opens a connection per operation, which is what pooling
+  is for.
+- **Direct** (no `-pooler`) → for schema creation and migration only.
+  PgBouncer transaction mode breaks session-level features.
+
+Keep `sslmode=require` in the string. Never commit it — `.env` locally,
+Streamlit secrets when deployed.
+
 ```bash
-export DATABASE_URL='postgresql://...'   # Neon, Supabase, anything
-python -c "import storage; storage.PostgresStorage('$DATABASE_URL').init_schema()"
+# schema creation: use the DIRECT string
+python -c "import storage; storage.PostgresStorage('<DIRECT_URL>').init_schema()"
+
+# then point the app at the POOLED string
+export DATABASE_URL='<POOLED_URL>'
 ```
 
 `get_storage()` switches automatically once `DATABASE_URL` is set. To carry
 local dialogues over:
 
 ```bash
-python -c "import storage; storage.migrate_json_to_postgres('./data', '$DATABASE_URL')"
+python -c "import storage; storage.migrate_json_to_postgres('./data', '<DIRECT_URL>')"
 ```
 
 Ids are preserved, so share links stay valid. Not idempotent — run it once
 against a fresh database.
+
+## Upgrading an existing database
+
+`init_schema()` is idempotent and includes the `ALTER TABLE ... ADD COLUMN
+IF NOT EXISTS` statements for columns added after the first release
+(`selection`, `reference`). Re-running it against a live database is safe:
+
+```bash
+python -c "import storage; storage.PostgresStorage('<DIRECT_URL>').init_schema()"
+```
+
+Dialogues created before a column existed simply have it null — an older
+dialogue shows no expected-tensions panel and no reference material, which
+is correct rather than broken.
 
 ## Deploying
 

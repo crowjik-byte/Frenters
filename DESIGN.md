@@ -346,17 +346,357 @@ skew.)
 
 ---
 
+## Next iteration — confirmed, build together
+
+**Status: N1–N10 are DONE** (engine + app, tested with stubbed model
+calls; not yet run against a live dialogue). They were one defect in three
+places: every component that needed the roster's actual state either lacked
+it, had it in a misleading form, or measured it by the wrong proxy. Details
+under each item below. The list is clear; what follows is the record of why each is the way it is.
+
+Not open questions. Decided; deferred only so the first real test finishes
+before the code changes under it.
+
+### N1. ~~Add a perspective mid-dialogue~~ — DONE
+
+Currently the roster is snapshotted into the dialogue at creation and there
+is no path to add to it. Wanted, and confirmed by hitting the same wall
+twice — in this app's design and independently while testing the in-session
+HTML artifact. The case is one the exchange itself creates: a dialogue
+reveals it needs a perspective nobody thought to include, and the only
+current remedy is starting over.
+
+Design points to settle when building:
+
+- **The new agent joins without a history.** It reads the transcript as a
+  latecomer. Whether it's told plainly that it joined at turn N, or simply
+  handed the transcript like everyone else, is a real choice — the first is
+  honest and may license "I've only just arrived"; the second is uniform
+  with how every other agent is prompted.
+- **The existing agents' roster block is stale.** Their system prompts are
+  built per call from the current roster, so this resolves itself on their
+  next turn. But the *transcript* shows the new name appearing with no
+  introduction, which is fine and is what happens when someone walks into a
+  seminar.
+- **Where the agent comes from**: the original sweep's candidate list (still
+  stored on the dialogue in `sweep`), the personal library, or freshly
+  written. All three are wanted; the sweep list is the cheapest since it's
+  already there.
+- **Removing** an agent mid-dialogue is a different and weaker case — the
+  transcript already contains their turns, so removal only stops future
+  ones. Probably not worth building.
+
+### N2. ~~Confirm the selection before personas are written~~ — DONE
+
+Currently `select_perspectives` picks the slate *and* writes full personas in
+one call, so the first thing shown is a finished product. Wanted instead:
+**pick → show which ones, with the rest of the candidate list still visible →
+concur or change → then write personas.**
+
+Split into two engine functions:
+
+- `choose_perspectives(question, candidates, count)` → names only, plus
+  `rationale` and `near_misses`. Short output, cheap call.
+- `write_personas(question, chosen, candidates)` → full `persona` and
+  `description` for the agreed names, all in one pass.
+
+Two reasons this is more than a UI change:
+
+- **A swap currently costs a full rewrite.** Changing one perspective after
+  selection goes through `refine_perspectives`, which returns the whole slate
+  and rewrites all five personas. Confirming first means a swapped-in
+  perspective gets its persona written *in the same pass* as the others —
+  the personas are composed with awareness of each other, so the tensions
+  are complementary by construction rather than retrofitted.
+- **The overlap counter lands at the decision point.** How many of the
+  model's own stated first instincts survived into the slate is exactly the
+  number you want before committing, not after.
+
+Keep `select_perspectives` as a thin wrapper over both for callers that
+don't want the confirmation step.
+
+### N3. ~~Start a dialogue from the library~~ — DONE
+
+`page_new_dialogue` only creates a dialogue via sweep → select → commit.
+Agents are saved to the library on commit (with `source_question`), but
+there is no path to *use* them — so continuing a question with the same
+slate means redoing the sweep.
+
+The case that surfaces it: a long dialogue degrades in quality (agents start
+summarizing the exchange back and hedging across everything already said),
+so you summarize, start fresh, and carry the same roster forward. Same
+shape as starting a new chat. Not a cost problem — a 30-turn dialogue is
+single-digit dollars and nowhere near the context limit — a *quality at
+length* problem.
+
+Wanted: pick a roster from the library, optionally seeded with a prior
+dialogue's summary as the opening turn.
+
+**Built as predicted.** `pick_names()` in `app.py` is one picker over three
+sources (stored sweep candidates, library, hand-typed with a note), and
+N1, N2, N3 and N8 are all thin wrappers over it. `picked_with_notes()`
+carries a hand-typed note through to the persona writer, so a perspective
+nobody swept is written from the person's own one-line gloss rather than
+from the name alone.
+
+### N4. ~~The curiosity tally under-counts~~ — DONE
+
+`curiosity_tally` / `never_named` replaced by `engagement_tally` /
+`never_engaged`, returning three separate signals:
+
+- `named` — an agent used another participant's name.
+- `quoted` — an agent reproduced a run of another's earlier words (7-gram
+  match, floor tuned so short shared phrases don't fire) without naming
+  them. This is the case the old version missed entirely.
+- `early` — a name used before that participant had taken any turn.
+
+**`early` is deliberately left ambiguous, and testing forced that.** The
+first version called it `phantom` and treated it as a hallucination
+counter. But the real transcript contains both shapes: Predictive
+Processing's *"I would push directly on that with Theravada"* before
+Theravada had spoken (a legitimate forward nomination — exactly the
+behavior the roster block is for) and Theravada's *"SomaticExperiencing has
+pressed on..."* (the false attribution). Structurally identical; the
+difference is attributing a past speech act versus requesting a future one,
+and no reliable mechanical test separates them. So it flags turns to read
+rather than asserting an error.
+
+Still missed: engagement by paraphrase that neither names nor reproduces
+words. Stated in the UI caption rather than papered over.
+
+**Found in the first real dialogue.** Predictive Processing addressed
+Theravada by name — registered. Theravada then put a question to Predictive
+Processing by quoting its earlier text without using its name — not
+registered.
+
+This is worse than the over-counting already documented in the code, because
+it corrupts the one reading claimed as reliable. "Never named by anyone" was
+offered as meaning *nobody engaged with them*. It actually means *nobody
+used their name*, and an agent can be the most engaged-with participant in
+a dialogue while showing up as never named. **Downgrade that claim in the
+code comment and in the UI caption.**
+
+Two different things are measurable and were being conflated:
+
+- **Explicit nomination** — naming a participant and saying what you want
+  from them. What the roster instruction actually asks for. What the tally
+  measures.
+- **Directed engagement** — a question aimed at a specific participant,
+  however phrased. What the tally was described as measuring.
+
+**Open, and possibly more interesting than the fix:** whether
+naming-versus-quoting is a distinction worth tracking rather than noise to
+correct for. Naming treats someone as a participant with standing;
+engaging with their words without naming treats what they said as material.
+Those may be the same act in different clothes, or not. One observed pair
+is a hypothesis, not a finding — recency and the shape of the specific
+question explain it equally well. But it is the kind of asymmetry that is
+invisible reading a transcript straight through, which is what the tally
+exists for.
+
+Approaches, if it gets fixed at all: match against prior turns' text to
+catch quotation (fragile); or have a model extract nominations from the
+transcript (reliable, costs a call, and is Claude scoring Claude — same
+structural problem as the other logs in this project, so it would be a
+pointer to transcripts worth reading rather than a measurement).
+
+### N5. ~~The roster block gets read as contributed content~~ — DONE
+
+**Found in the first real dialogue, and confirmed verbatim in the
+transcript.** Theravada wrote: *"Somatic_Experiencing_Levine has pressed on
+whether this is genuine completion or a dissociative override."*
+Somatic_Experiencing_Levine had never taken a turn. Its roster
+`description` reads: *"asks whether apparent non-identification might be a
+dissociative override rather than genuine completion."* The hallucinated
+speech act is a near-verbatim restatement of the description — mechanism
+confirmed, not inferred.
+
+Note the contrast in the same transcript: Krishnamurti wrote *"Predictive
+Processing put it well when it said the meta-frame of the witnessing
+meditator is still a prior"* — which Predictive Processing had actually
+said, accurately attributed. Agents read the transcript correctly. The
+failure is specifically that roster descriptions are indistinguishable
+from transcript content, not a general attribution problem.
+
+Not an invention from nothing. `build_roster_block` gives every agent the
+others' `description` fields, and those are written as *"Holds that… Presses
+other perspectives on whether…"* — formally indistinguishable from a summary
+of positions already argued. So an agent has two sources of information
+about a participant (the transcript, and a paragraph that reads like a
+précis of their view) and nothing in the prompt marks them as different
+kinds of thing.
+
+This is the failure the description-not-persona rule was supposed to
+prevent, and it stopped short. The problem is not detail level; it is the
+**absence of any marker that these are positions held rather than things
+said**.
+
+**Fixed, both parts.** `ROSTER_HEADER` now states that the block describes
+what each participant *holds*, that only the transcript records what anyone
+said, and that a participant marked silent must not be described as having
+pressed, asked or claimed anything. `build_roster_block` takes a `spoken`
+set and renders *(has not spoken yet)*. `ask_agent` derives that set from
+the turns itself via `spoken_names()`, so no caller can forget it.
+
+**Third contamination of the tally (see N4).** A nomination prompted by
+content a participant never produced is interest in their *description*,
+not in what they said. The roster block can therefore generate nominations
+rather than merely enable them — which also means the curiosity signal is
+partly an artifact of how the descriptions were written.
+
+### N6. ~~Expected-tensions panel, and store the selection rationale~~ — DONE
+
+The first run used three of five perspectives for thirteen turns —
+deliberately, working one thread at a time, with the other two still
+intended. So the gap isn't that the human loses track of *who* hasn't
+spoken; it's that nothing keeps **why each perspective was chosen** in
+view while the dialogue runs. The selector predicted that Krishnamurti and
+the Stoics contradict each other on trained capacity versus sudden
+non-causal seeing, and that Somatic Experiencing would press all four on
+whether apparent non-identification is dissociative override. By turn
+thirteen that reasoning exists nowhere on screen.
+
+Wanted: a side panel listing the expected tensions, as a standing reminder
+of what the slate was built to produce.
+
+**Prerequisite — the rationale is currently discarded.** `create_dialogue`
+stores `sweep` but not `selection_meta`. The rationale and `near_misses`
+live only in session state and are lost at commit. Persist them on the
+dialogue record; without that there is nothing for the panel to show.
+
+**Ask the selector for structure, don't parse prose.** The rationale is
+one blob. A panel wants pairwise entries — `{a, b, tension}` — plus
+optional "presses everyone on X" entries for perspectives that cut across
+the slate rather than opposing one other. That's a key in the selector's
+JSON contract, which N2 is reworking anyway. Do both at once.
+
+**Note it's a prediction.** These tensions are what the selector expected,
+not what happened. A dialogue that doesn't produce the predicted
+disagreement is a finding about the slate (or the selector), not a
+failure by the human to cover the material — and the panel shouldn't read
+as a checklist. Label it as expected, not required.
+
+**Interacts with N3.** A dialogue with perspectives still unused is a good
+candidate for carrying the roster forward rather than starting fresh.
+
+### N7. ~~The moderator has no roster and no speaker list~~ — DONE
+
+**Found on the first Observer run.** It reported that Theravada's question
+to Somatic_Experiencing_Levine "received no response" and "dropped out of
+the exchange" — treating SE as a participant who failed to answer. SE had
+never taken a turn. It also did not flag Theravada's claim that SE "has
+pressed on" a point, which is the N5 false attribution.
+
+`ask_moderator` passes only the question, the human participant names, and
+the transcript. No roster. So the Observer inferred SE's presence from
+Theravada's reference to it — the same error as N5, propagating one layer
+down: a referenced participant read as a participant who spoke.
+
+**Fixed.** New `build_participant_ledger(agents, turns, humans)` renders
+names, kinds and turn counts — no descriptions, since those are what
+produced the hallucination it failed to catch. `ask_moderator` takes
+`agents` and prepends it, closing with a line saying that a reference to a
+silent participant points at no turn in the record and naming it is its
+job. `agents` is optional; without it the old humans-only note is used, so
+existing callers don't break.
+
+**Everything else on this run was strong** and argues against touching the
+persona: it caught the question changing form mid-dialogue (switching
+mechanism → whether any process in time reaches outside it) with nobody
+naming the shift; a concession made and then not carried through
+(Predictive_Processing conceded the meta-frame point, then continued
+operating the prior/error-signal framework unchanged); one word used by
+two participants for possibly different referents without either noticing
+("collapse"); a direct contradiction neither addressed; and four candidate
+answers to the original question never compared. It marked one item
+explicitly as observation rather than judgment, stayed non-directive
+throughout, and did not manufacture findings under an open summons.
+
+**Feeds the summarizer review.** The concession-without-consequence catch
+is the pattern summary item 5 (rhetorical vs. logical force) is meant to
+surface. Worth comparing what the summarizer produces on this same
+transcript before deciding whether item 5 earns its length.
+
+### N8. ~~Recommend a perspective, mid-dialogue~~ — DONE
+
+Distinct from N1. N1 is adding a perspective the human has already decided
+on; this is asking *what's missing* — "recommend a perspective that could
+speak to the question that's come up here from a different angle," or "that
+would be a useful counterweight to where this has gone."
+
+**The trap, and it's the same one the first sweep exposed.** A recommender
+conditioned on a transcript is reading a dialogue that has already
+converged on a frame, so it is *more* exposed to the adversarial-traction
+bias than the original sweep was, not less. There the criterion "would
+reach different conclusions" silently excluded perspectives that decline
+the question rather than answering it differently (Ubuntu, the
+depersonalization entry — not rejected, never considered). With a live
+frame on the page, "counterweight" will tend to return disagreement
+*within* the frame, which is the easy thing to supply and not what was
+asked for.
+
+Two modes, worth keeping separate:
+
+1. **From the stored sweep candidates.** Already on the dialogue record,
+   no retrieval call needed, and — the real advantage — chosen before the
+   frame converged, so it is partly protected against frame-capture by
+   construction.
+2. **Fresh sweep conditioned on the transcript.** New material, full
+   frame-capture exposure. Needs the counterweight instruction written
+   carefully: ask explicitly for perspectives that would question the terms
+   the dialogue has settled into, not only ones that would answer
+   differently within them.
+
+**Do not implement this as an Observer function.** The obvious move is to
+ask the Observer, which already reads the record and demonstrably sees what
+is missing. Its persona states it has no authority to direct and that
+naming is the whole job. Recommending who should join is directing. Keep
+it a separate call.
+
+### N9. ~~`refine_question`~~ — DONE
+
+Port from the old engine. Independent of the run loop, and the question is
+what the entire sweep is conditioned on — a sharper question is the highest-
+leverage edit available anywhere in the flow.
+
+### N10. ~~Reference material upload~~ — DONE
+
+Port `extract_text_from_upload` and `prepare_reference_material`. Shared
+across all agents in a dialogue, text-extraction only (no OCR). Primary use
+is downloaded research papers.
+
+**Resolved: perspective agents only.** The Observer and Summarizer do not
+receive it, and that is a decision about what those agents ARE rather than
+plumbing. An observer that has read the sources could say "you misread that
+paper" — which is adjudicating between participants, and its persona states
+plainly that it does not adjudicate. The Summarizer reports what happened
+in the exchange, not how the exchange measures against the literature.
+Asserted in `ask_agent`'s docstring and covered by a test, so it can't drift
+back by accident.
+
+**Also decided:** the reference block tells agents to use the material where
+it bears on what they are saying and to cite it checkably, but explicitly
+not to treat it as authoritative merely because it was provided — a
+perspective's position may be that a source is mistaken or answers a
+different question. Without that, uploading a paper quietly converts the
+dialogue into an exegesis of it.
+
+The 60k-character cap is about per-turn cost across a long dialogue, not the
+context window, which is nowhere near it. Scanned PDFs raise rather than
+returning empty text: a silent failure here is invisible until an agent
+confidently discusses a document it never received.
+
+---
+
 ## Still open
 
 1. **Persistence backend** — blocks the storage layer and the deploy target.
 2. **API key exposure.** Accepted for now — low volume, family scale, one
    key. Set a console spend limit as the backstop. Revisit if the app ever
    goes wider than people who are personally sent a link.
-3. **Does `refine_question` come over?** Independent of the run loop, and
-   useful in a friendly app. Not decided.
+3. *(moved to N9 — decided.)*
 4. **The optional moderator presupposition line** (see §7).
-5. **Reference material / file upload** — `extract_text_from_upload` and
-   `prepare_reference_material` port cleanly if wanted. Not in scope for v1.
+5. *(moved to N10 — decided.)*
 6. **Review the summarizer instructions against real transcripts.** The
    default checklist was written for the auto-run app and inherited here
    with two edits (item 1 scoped to perspective agents, the dead

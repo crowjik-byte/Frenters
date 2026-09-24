@@ -52,6 +52,13 @@ DEFAULT_TURN_MAX_TOKENS = 4000
 DEFAULT_MODERATOR_MAX_TOKENS = 3000
 DEFAULT_SUMMARY_MAX_TOKENS = 5000
 DEFAULT_GENERATOR_MAX_TOKENS = 4000
+DEFAULT_REFINER_MAX_TOKENS = 4000
+
+# Reference material is prepended to every perspective agent's system
+# prompt, so it is paid for on every turn. The cap is about keeping a
+# dialogue affordable and legible across many turns, not about the context
+# window, which is nowhere near this.
+DEFAULT_MAX_REFERENCE_CHARS = 60_000
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
@@ -146,6 +153,200 @@ def call_model_with_meta(model, system_prompt, user_message,
 
     truncated = getattr(response, "stop_reason", None) == "max_tokens"
     return text, truncated
+
+
+# ---------------------------------------------------------------------------
+# QUESTION REFINEMENT
+#
+# The question conditions the entire sweep, so a sharper question is the
+# highest-leverage edit available anywhere in this flow -- which is why
+# this is a conversation rather than a one-shot rewrite.
+# ---------------------------------------------------------------------------
+
+QUESTION_REFINER_SYSTEM_PROMPT = """
+You are helping someone refine a single, precise question for a dialogue
+between several AI agents reasoning from different named perspectives,
+directed turn by turn by the person themselves. This is a conversation,
+not a one-shot request: read what they have said so far and respond the
+way a thoughtful editor would -- sometimes asking a focused clarifying
+question, sometimes proposing a candidate, sometimes both in one turn.
+
+Ask a clarifying question when the framing, scope or intent is genuinely
+ambiguous in a way that would change what a good question looks like --
+not for every minor thing that could be asked. Propose a candidate once
+you have enough to work with, even as a rough first attempt meant to be
+reacted to. You can propose a tentative candidate and flag one specific
+thing you are unsure about in the same turn.
+
+One thing to watch for, and raise when you see it: a question can carry a
+frame that decides the answer before anyone speaks. If the phrasing
+assumes a structure -- that there is one entity with two states, that the
+matter is interior, that the answer is a mechanism -- say so plainly.
+Some perspectives will be unable to enter the dialogue at all if the
+question forecloses their starting point, and the person may not want
+that. This is not an instruction to broaden every question; a tightly
+framed question is often exactly right. It is an instruction to make the
+frame visible so the choice is deliberate.
+
+Keep your conversational reply focused -- a short paragraph or two, not an
+essay -- and do not restate the whole conversation back to the person.
+
+Whenever you propose a candidate question (a first attempt or a revision),
+include it wrapped EXACTLY like this, with nothing else inside the tags
+and appearing nowhere else in your reply:
+
+<<<PROPOSED_QUESTION>>>
+(the candidate question itself, and nothing else)
+<<<END_PROPOSED_QUESTION>>>
+
+At most one such block per reply. If you are only asking a clarifying
+question this turn and have nothing new to propose, omit the block
+entirely rather than repeating an earlier proposal unchanged.
+""".strip()
+
+
+def extract_proposed_question(raw_text):
+    """
+    Split a refiner reply into (display_text, proposed_question).
+
+    A malformed or unclosed tag is treated as "no proposal" rather than
+    raising -- this is display logic and should never crash a chat turn.
+    """
+    start_tag, end_tag = "<<<PROPOSED_QUESTION>>>", "<<<END_PROPOSED_QUESTION>>>"
+    start, end = raw_text.find(start_tag), raw_text.find(end_tag)
+    if start == -1 or end == -1 or end < start:
+        return raw_text.strip(), None
+    proposed = raw_text[start + len(start_tag):end].strip()
+    display = (raw_text[:start] + raw_text[end + len(end_tag):]).strip()
+    return display, (proposed or None)
+
+
+def build_question_refiner_prompt(history, latest_message):
+    """
+    `history`: [{"role": "user"|"assistant", "content": str}] for turns
+        before this one. Assistant content is the raw reply including any
+        proposal tags -- harmless as context, and avoids keeping two
+        copies of the same text. Pass [] for a first message.
+    """
+    if history:
+        block = "".join(
+            f"{'Person' if t['role'] == 'user' else 'You'}: {t['content']}\n\n"
+            for t in history)
+    else:
+        block = "(none yet -- this is the first message)\n"
+    return (f"CONVERSATION SO FAR:\n\n{block}"
+            f"NEW MESSAGE FROM THE PERSON: {latest_message}\n\n"
+            "Respond per your system instructions.")
+
+
+def refine_question(history, latest_message, model=None,
+                    max_tokens=DEFAULT_REFINER_MAX_TOKENS, effort=None):
+    """
+    One turn of the question-refinement chat. Returns
+    {"reply": raw, "display_reply": str, "proposed_question": str|None}.
+
+    `reply` (raw, tags intact) is what goes back into `history`;
+    `display_reply` is what to show.
+    """
+    if model is None:
+        model = PERSPECTIVE_GENERATOR_MODEL
+    prompt = build_question_refiner_prompt(history, latest_message)
+    raw = call_model(model, QUESTION_REFINER_SYSTEM_PROMPT, prompt,
+                     max_tokens=max_tokens, effort=effort)
+    display, proposed = extract_proposed_question(raw)
+    return {"reply": raw, "display_reply": display, "proposed_question": proposed}
+
+
+# ---------------------------------------------------------------------------
+# REFERENCE MATERIAL
+#
+# Uploaded documents every perspective agent can consult. Extraction lives
+# here rather than in the app so it stays usable outside Streamlit.
+#
+# Text-based PDFs via pdfplumber; no OCR. A scanned PDF raises a clear
+# error rather than silently returning empty or garbled text, because the
+# failure is otherwise invisible until an agent confidently discusses a
+# document it never received.
+# ---------------------------------------------------------------------------
+
+def extract_text_from_upload(file_bytes, filename):
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext in ("txt", "md"):
+        return file_bytes.decode("utf-8", errors="replace").strip()
+    if ext == "pdf":
+        return _extract_text_from_pdf(file_bytes, filename)
+    raise ValueError(
+        f"Unsupported file type for '{filename}': .{ext} -- supported types are "
+        f".txt, .md, and text-based .pdf (not scanned/image PDFs).")
+
+
+def _extract_text_from_pdf(file_bytes, filename):
+    import io
+    import pdfplumber  # extra dependency -- see requirements.txt
+
+    parts = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            parts.append(page.extract_text() or "")
+    full = "\n\n".join(parts).strip()
+
+    # Heuristic, not a guarantee: a text-based PDF yields far more than
+    # this. A near-empty result is the signature of a scanned one.
+    if len(full) < 200:
+        raise ValueError(
+            f"'{filename}' produced little or no extractable text -- it is likely "
+            f"a scanned or image-based PDF, which isn't supported here. Try one "
+            f"where you can select and copy text in a normal PDF viewer.")
+    return full
+
+
+def prepare_reference_material(files, max_chars=DEFAULT_MAX_REFERENCE_CHARS):
+    """
+    `files`: [(filename, file_bytes)].
+
+    Returns (combined_text, per_file_results, truncated). Per-file results
+    are {"filename", "chars", "error"} so the caller can report which files
+    made it in without re-parsing -- a file that failed silently is the
+    worst outcome here.
+    """
+    parts, results = [], []
+    for filename, file_bytes in files:
+        try:
+            text = extract_text_from_upload(file_bytes, filename)
+            results.append({"filename": filename, "chars": len(text), "error": None})
+            parts.append(f"--- FILE: {filename} ---\n\n{text}")
+        except Exception as err:
+            results.append({"filename": filename, "chars": 0, "error": str(err)})
+
+    combined = "\n\n".join(parts).strip()
+    truncated = False
+    if len(combined) > max_chars:
+        combined = combined[:max_chars].rstrip()
+        combined += (f"\n\n[NOTE: reference material was truncated to "
+                     f"{max_chars:,} characters -- content after this point was cut.]")
+        truncated = True
+    return combined, results, truncated
+
+
+REFERENCE_FRAME = """
+REFERENCE MATERIAL PROVIDED BY THE PERSON RUNNING THIS DIALOGUE
+
+Documents they uploaded for everyone to consult. Shared by all
+perspectives -- nobody has private access to any of it.
+
+Use it where it bears on what you are saying, and cite it specifically
+enough to be checked (which file, which claim). Do not treat it as
+authoritative merely because it was provided: it is material, and your own
+position may be that it is mistaken, or that it answers a different
+question. Do not feel obliged to reference it in a turn where it does not
+apply.
+""".strip()
+
+
+def build_reference_block(reference_material):
+    if not reference_material or not reference_material.strip():
+        return ""
+    return f"{REFERENCE_FRAME}\n\n{reference_material.strip()}"
 
 
 # ---------------------------------------------------------------------------
@@ -316,22 +517,54 @@ You may address the humans directly, the same as any other participant.
 """.strip()
 
 
-def build_roster_block(agents, humans=(), speaking_as=None):
+ROSTER_HEADER = """
+THE PARTICIPANTS IN THIS DIALOGUE
+
+What follows describes what each participant HOLDS -- their standing
+position, what they would say if asked. It is not a record of anything
+anyone has said here. Only the transcript records that. Where a
+participant is marked as not having spoken yet, they have contributed
+nothing to this exchange: do not attribute arguments, questions or
+challenges to them, and do not refer to them as having pressed, asked or
+claimed anything.
+""".strip()
+
+
+def spoken_names(turns):
+    """Who has actually taken a turn. Derived from the record, not asserted."""
+    return {t["speaker"] for t in turns}
+
+
+def build_roster_block(agents, humans=(), speaking_as=None, spoken=None):
     """
     `agents`: the full roster (perspective + utility).
     `humans`: display names of human participants.
     `speaking_as`: name of the agent this block is being built for, so it
         isn't described to itself.
+    `spoken`: names that have taken a turn (see spoken_names). Participants
+        not in it are marked as silent so far.
+
+    `spoken` exists because the descriptions below are written as "Holds
+    that... Presses others on..." and are formally indistinguishable from a
+    summary of what someone already argued. Without the marker, agents
+    attribute speech acts to participants who have never spoken -- observed
+    in the first real dialogue, near-verbatim from the description.
     """
-    lines = ["THE PARTICIPANTS IN THIS DIALOGUE:", ""]
+    silent = " *(has not spoken yet)*"
+
+    def mark(name):
+        return "" if spoken is None or name in spoken else silent
+
+    lines = [ROSTER_HEADER, ""]
 
     for a in perspective_agents(agents):
         if a["name"] == speaking_as:
             continue
-        lines.append(f"- {a['name']} — {a['description']}")
+        lines.append(f"- {a['name']}{mark(a['name'])} — {a['description']}")
 
     for h in humans:
-        lines.append(f"- {h} — a human participant. Takes part directly and directs the dialogue.")
+        lines.append(f"- {h}{mark(h)} — a human participant. Takes part directly "
+                     f"and directs the dialogue.")
 
     utilities = [a for a in utility_agents(agents) if a["name"] != speaking_as]
     if utilities:
@@ -341,7 +574,7 @@ def build_roster_block(agents, humans=(), speaking_as=None):
             "(they act on the dialogue rather than in it):"
         )
         for a in utilities:
-            lines.append(f"- {a['name']} — {a['description']}")
+            lines.append(f"- {a['name']}{mark(a['name'])} — {a['description']}")
 
     lines.append("")
     lines.append(CURIOSITY_INSTRUCTION)
@@ -352,19 +585,23 @@ def build_roster_block(agents, humans=(), speaking_as=None):
 # AGENT TURNS
 # ---------------------------------------------------------------------------
 
-def build_agent_system_prompt(agent, agents, humans=(), extra_instructions=None):
+def build_agent_system_prompt(agent, agents, humans=(), extra_instructions=None,
+                              spoken=None, reference_material=None):
     parts = [
         agent["persona"],
         PARTICIPATION_FRAME,
-        build_roster_block(agents, humans=humans, speaking_as=agent["name"]),
+        build_roster_block(agents, humans=humans, speaking_as=agent["name"],
+                           spoken=spoken),
         extra_instructions,
+        build_reference_block(reference_material),
     ]
     return "\n\n".join(p.strip() for p in parts if p and p.strip())
 
 
 def ask_agent(agent, agents, question, turns, humans=(),
               model=DEFAULT_SESSION_MODEL, max_tokens=DEFAULT_TURN_MAX_TOKENS,
-              effort=None, extra_instructions=None, length_hint=None):
+              effort=None, extra_instructions=None, length_hint=None,
+              reference_material=None):
     """
     One turn from one perspective agent.
 
@@ -375,6 +612,16 @@ def ask_agent(agent, agents, question, turns, humans=(),
 
     `length_hint`: overrides the default brevity nudge. A clarification
     request shouldn't get three paragraphs.
+
+    `reference_material`: shared uploaded documents. Passed to PERSPECTIVE
+    agents only -- deliberately not to the moderator or summarizer. An
+    observer that has read the sources is a different instrument from one
+    that has read only the exchange: it could say "you misread the paper,"
+    which is adjudicating between participants, and its persona states it
+    does not adjudicate. Same for the summarizer, which reports what
+    happened in the exchange rather than assessing it against the
+    literature. If that changes, change it deliberately -- it is a
+    decision about what those agents ARE, not a plumbing oversight.
     """
     if agent["kind"] != "perspective":
         raise ValueError(
@@ -382,8 +629,11 @@ def ask_agent(agent, agents, question, turns, humans=(),
             f"Use ask_moderator or summarize_dialogue for utility agents."
         )
 
+    # Derived from the turns rather than passed in, so no caller can get it
+    # wrong or forget it.
     system_prompt = build_agent_system_prompt(
-        agent, agents, humans=humans, extra_instructions=extra_instructions
+        agent, agents, humans=humans, extra_instructions=extra_instructions,
+        spoken=spoken_names(turns), reference_material=reference_material,
     )
 
     if length_hint is None:
@@ -514,25 +764,70 @@ def default_moderator():
     }
 
 
-def ask_moderator(moderator, question, turns, humans=(),
+def build_participant_ledger(agents, turns, humans=()):
+    """
+    A factual list of who is present and who has actually taken a turn.
+
+    Deliberately carries NO descriptions. Descriptions are what caused
+    agents to attribute speech acts to silent participants; handing them to
+    an observer whose job is checking claims against the record would
+    reproduce the error in the one place meant to catch it. Names, kinds,
+    and turn counts only -- all of it derived from the transcript.
+    """
+    counts = {}
+    for t in turns:
+        counts[t["speaker"]] = counts.get(t["speaker"], 0) + 1
+
+    lines = ["WHO IS PRESENT, AND WHO HAS ACTUALLY SPOKEN", ""]
+
+    def row(name, role):
+        n = counts.get(name, 0)
+        state = f"{n} turn{'s' if n != 1 else ''}" if n else "HAS NOT SPOKEN IN THIS EXCHANGE"
+        return f"- {name} ({role}) — {state}"
+
+    for a in perspective_agents(agents):
+        lines.append(row(a["name"], "perspective"))
+    for h in humans:
+        lines.append(row(h, "human participant"))
+    for a in utility_agents(agents):
+        lines.append(row(a["name"], "utility"))
+
+    lines.append("")
+    lines.append(
+        "A participant marked as not having spoken has contributed nothing "
+        "to this exchange. If another participant refers to them as having "
+        "pressed, asked, argued or claimed something, that reference is to "
+        "no turn in the record, and naming it is squarely your job."
+    )
+    return "\n".join(lines)
+
+
+def ask_moderator(moderator, question, turns, humans=(), agents=None,
                   model=DEFAULT_SESSION_MODEL,
                   max_tokens=DEFAULT_MODERATOR_MAX_TOKENS, effort=None):
     """
     `turns` must already contain the summoning turn -- same convention as
     ask_agent. The summons is visible in the transcript AND named in the
     prompt below, because this agent answers what it was asked.
+
+    `agents` supplies the participant ledger. Without it the observer has
+    no way to tell a participant who spoke from one who was merely
+    referred to, and will read the second as the first -- observed on the
+    first real run.
     """
     transcript = render_transcript(turns)
     if not transcript:
         raise ValueError("Nothing to observe -- the dialogue is empty.")
 
-    roster_note = ""
-    if humans:
-        roster_note = f"\n\nHuman participants in this dialogue: {', '.join(humans)}."
+    ledger = ""
+    if agents:
+        ledger = "\n\n" + build_participant_ledger(agents, turns, humans=humans)
+    elif humans:
+        ledger = f"\n\nHuman participants in this dialogue: {', '.join(humans)}."
 
     user_message = (
         f"The question under exploration is: {question}"
-        f"{roster_note}\n\n"
+        f"{ledger}\n\n"
         f"The exchange so far:\n\n{transcript}\n\n"
         f"The final turn above is addressed to you. Answer what was asked, "
         f"in the manner your instructions describe."
@@ -928,86 +1223,110 @@ def sweep_candidates(question, count=DEFAULT_SWEEP_COUNT, model=None,
 
 # --- Pass 2: the selection --------------------------------------------------
 
-SELECTION_INSTRUCTIONS = f"""
-You are selecting a slate of perspectives for a multi-agent dialogue from a
-candidate list produced by an earlier wide sweep, and writing the full
-persona and description for each one you select.
+CHOICE_INSTRUCTIONS = f"""
+You are choosing which perspectives will take part in a multi-agent
+dialogue, from a candidate list produced by an earlier wide sweep. You are
+NOT writing their personas yet -- that happens separately, after a person
+has reviewed and possibly changed your choice. Choose, and say why.
 
 {_SELECTION_STANDARDS}
 
-{_PERSPECTIVE_FIELD_SPEC}
-
-Select from the candidate list. Use candidate names verbatim where you
-select one. If the list is genuinely missing something the question needs,
-you may add it, but say so in your rationale rather than doing it silently.
+Choose from the candidate list. Use candidate names verbatim. If the list
+is genuinely missing something the question needs, you may add it, but say
+so in your rationale rather than doing it silently.
 
 Return ONLY a single JSON object, and nothing else -- no preamble, no
-markdown code fence, no commentary outside the JSON. Exactly three keys:
+markdown code fence, no commentary outside the JSON. Exactly four keys:
 
-  "perspectives": an array of objects, each with exactly "name", "persona"
-    and "description" as specified above. Produce exactly the number
-    requested.
-  "rationale": a short paragraph on why this combination, and what tension
-    you expect between them.
-  "near_misses": an array of objects, each with "name" (from the candidate
-    list) and "why_not" (one line). Include the candidates that were
-    genuinely close, not a token list. This is read by a person who may
-    overrule you.
+  "chosen": an array of names, exactly the number requested.
+  "rationale": a short paragraph on why this combination.
+  "tensions": an array of objects, each with "between" (an array of two or
+    more chosen names, or a single name where a perspective cuts across
+    the whole slate rather than opposing one other) and "tension" (ONE
+    line naming what they would actually disagree about). These are what
+    you EXPECT, not predictions anyone is obliged to fulfil. Give one for
+    each real fork you see; do not manufacture one per pair.
+  "near_misses": an array of objects with "name" (from the candidate list)
+    and "why_not" (one line). The candidates that were genuinely close,
+    not a token list. A person may overrule you using this.
+""".strip()
+
+PERSONA_WRITER_INSTRUCTIONS = f"""
+You are writing the personas for a slate of perspectives that has already
+been chosen and agreed for a multi-agent dialogue. The choosing is done --
+do not add, drop, or substitute anyone. Write all of them in one pass, so
+that each is composed with awareness of the others and the tensions
+between them fall out of what each holds rather than being asserted.
+
+{_PERSPECTIVE_FIELD_SPEC}
+
+Return ONLY a JSON array, and nothing else -- no preamble, no markdown code
+fence, no commentary. One object per perspective, in the order given, each
+with exactly three keys: "name" (verbatim as given to you), "persona" and
+"description".
 """.strip()
 
 
-def build_selection_prompt(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
-                           instructions=None):
+def build_choice_prompt(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
+                        instructions=None):
     if instructions is None:
-        instructions = SELECTION_INSTRUCTIONS
-
+        instructions = CHOICE_INSTRUCTIONS
     candidate_block = "\n".join(f"- {c['name']}: {c['note']}" for c in candidates)
     return (
         f'The dialogue question is: "{question}"\n\n'
         f"CANDIDATE PERSPECTIVES FROM THE SWEEP:\n{candidate_block}\n\n"
-        f"Select exactly {count} of these for the dialogue.\n\n"
+        f"Choose exactly {count} of these for the dialogue.\n\n"
         f"{instructions}\n"
     )
 
 
-def select_perspectives(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
+def choose_perspectives(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
                         model=None, instructions=None,
                         max_tokens=DEFAULT_GENERATOR_MAX_TOKENS, effort=None):
     """
-    Pass 2. Returns:
+    Pass 2a -- names and reasoning only, no personas.
 
-        {"perspectives": [agent dicts, validated],
-         "rationale": str,
-         "near_misses": [{"name": str, "why_not": str}, ...],
-         "added_outside_sweep": [str, ...]}
+    Split from persona-writing so a person can concur or change the slate
+    before any personas exist. Two payoffs: a swap no longer costs a full
+    rewrite of everyone's persona (the old single call wrote them during
+    selection, so changing one meant regenerating all five through the
+    refiner), and the overlap against the model's own stated defaults lands
+    while it is still decision-relevant.
 
-    `added_outside_sweep` is a soft check, not an error -- names in the
-    selection that weren't in the candidate list. The model is permitted to
-    add, but the person should be able to see when it did.
+    Returns {"chosen", "rationale", "tensions", "near_misses",
+             "added_outside_sweep"}.
     """
     if model is None:
         model = PERSPECTIVE_GENERATOR_MODEL
 
-    prompt = build_selection_prompt(question, candidates, count, instructions)
+    prompt = build_choice_prompt(question, candidates, count, instructions)
     raw = _strip_code_fence(
-        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort)
-    )
+        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort))
 
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Perspective selection did not return valid JSON: {e}\n"
-            f"Raw response was:\n{raw}"
-        )
+        raise ValueError(f"Perspective choice did not return valid JSON: {e}\n"
+                         f"Raw response was:\n{raw}")
 
-    if not isinstance(parsed, dict) or "perspectives" not in parsed:
-        raise ValueError(f"Selection response missing 'perspectives': {parsed!r}")
+    if not isinstance(parsed, dict) or "chosen" not in parsed:
+        raise ValueError(f"Choice response missing 'chosen': {parsed!r}")
 
-    agents = _parse_perspective_list(parsed["perspectives"])
+    chosen = [n for n in parsed["chosen"] if isinstance(n, str) and n.strip()]
+    if not chosen:
+        raise ValueError("Choice response contained no usable names.")
 
     candidate_names = {c["name"] for c in candidates}
-    added = [a["name"] for a in agents if a["name"] not in candidate_names]
+    tensions = []
+    for item in parsed.get("tensions") or []:
+        if not isinstance(item, dict) or "tension" not in item:
+            continue
+        between = item.get("between")
+        if isinstance(between, str):
+            between = [between]
+        if not between:
+            continue
+        tensions.append({"between": list(between), "tension": item["tension"]})
 
     near_misses = []
     for item in parsed.get("near_misses") or []:
@@ -1015,11 +1334,220 @@ def select_perspectives(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
             near_misses.append({"name": item["name"], "why_not": item.get("why_not", "")})
 
     return {
-        "perspectives": agents,
+        "chosen": chosen,
         "rationale": parsed.get("rationale", ""),
+        "tensions": tensions,
         "near_misses": near_misses,
-        "added_outside_sweep": added,
+        "added_outside_sweep": [n for n in chosen if n not in candidate_names],
     }
+
+
+def build_persona_writer_prompt(question, chosen, candidates=None, tensions=None,
+                                instructions=None):
+    """
+    `chosen`: names, or {"name", "note"} dicts. Notes are looked up from
+        `candidates` where available -- a name the person typed in by hand
+        simply has none, which is fine.
+    """
+    if instructions is None:
+        instructions = PERSONA_WRITER_INSTRUCTIONS
+
+    notes = {c["name"]: c.get("note", "") for c in (candidates or [])}
+    lines = []
+    for item in chosen:
+        name = item["name"] if isinstance(item, dict) else item
+        note = (item.get("note") if isinstance(item, dict) else None) or notes.get(name, "")
+        lines.append(f"- {name}: {note}" if note else f"- {name}")
+
+    tension_block = ""
+    if tensions:
+        rendered = "\n".join(
+            f"- {' / '.join(t['between'])}: {t['tension']}" for t in tensions)
+        tension_block = (
+            f"\nEXPECTED TENSIONS between these perspectives:\n{rendered}\n\n"
+            "Write each persona so these tensions follow from what it actually "
+            "holds. Do not name the other perspectives inside a persona or "
+            "instruct it to disagree with anyone -- the disagreement should be "
+            "a consequence of the position, not an instruction.\n")
+
+    return (
+        f'The dialogue question is: "{question}"\n\n'
+        f"THE AGREED SLATE:\n" + "\n".join(lines) + "\n"
+        f"{tension_block}\n{instructions}\n"
+    )
+
+
+def write_personas(question, chosen, candidates=None, tensions=None, model=None,
+                   instructions=None, max_tokens=DEFAULT_GENERATOR_MAX_TOKENS,
+                   effort=None):
+    """
+    Pass 2b -- full persona and description for an agreed slate, all in one
+    call so they are composed with awareness of each other.
+
+    Returns a list of validated agent dicts.
+    """
+    if model is None:
+        model = PERSPECTIVE_GENERATOR_MODEL
+
+    prompt = build_persona_writer_prompt(question, chosen, candidates=candidates,
+                                         tensions=tensions, instructions=instructions)
+    raw = _strip_code_fence(
+        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort))
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Persona writer did not return valid JSON: {e}\n"
+                         f"Raw response was:\n{raw}")
+
+    return _parse_perspective_list(parsed)
+
+
+def select_perspectives(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
+                        model=None, max_tokens=DEFAULT_GENERATOR_MAX_TOKENS,
+                        effort=None):
+    """
+    Choose and write in one go, for callers that don't want the
+    confirmation step. Two API calls.
+
+    Returns {"perspectives", "rationale", "tensions", "near_misses",
+             "added_outside_sweep"}.
+    """
+    choice = choose_perspectives(question, candidates, count=count, model=model,
+                                 max_tokens=max_tokens, effort=effort)
+    agents = write_personas(question, choice["chosen"], candidates=candidates,
+                            tensions=choice["tensions"], model=model,
+                            max_tokens=max_tokens, effort=effort)
+    return {"perspectives": agents,
+            **{k: choice[k] for k in ("rationale", "tensions", "near_misses",
+                                      "added_outside_sweep")}}
+
+
+# --- Mid-dialogue: what's missing? ------------------------------------------
+#
+# Distinct from adding a perspective the human has already decided on. This
+# asks what the exchange is lacking.
+#
+# The hazard is specific and worth stating in the prompt rather than hoping
+# against: a recommender reading a transcript is reading a dialogue that has
+# already converged on a frame, so it is MORE exposed to the
+# adversarial-traction bias than the original sweep was, not less. Asked for
+# a counterweight, the easy thing to return is disagreement within the frame.
+# Hence the explicit instruction below to consider perspectives that would
+# question the terms rather than only answer differently inside them.
+#
+# Two modes. With `candidates` (the dialogue's stored sweep), it recommends
+# from material chosen BEFORE the frame converged -- partly protected by
+# construction, and no retrieval needed. Without, it retrieves fresh, which
+# finds new material at full exposure to frame capture.
+
+RECOMMENDER_INSTRUCTIONS = f"""
+You are recommending perspectives that could usefully join a dialogue
+already in progress. You are not summarizing the exchange and not saying
+who is right.
+
+{_POSITION_BAR}
+
+First, state in one or two sentences what frame the dialogue has settled
+into -- the terms, assumptions and shared vocabulary the participants are
+now operating inside, including ones none of them has stated.
+
+Then recommend perspectives of two kinds, and label which is which:
+
+  "within" -- would answer the live question differently using roughly the
+    terms already in play. Useful, and the easier thing to find.
+  "questions_the_frame" -- would decline the question as currently posed,
+    or would need it re-asked before it could answer, because its own
+    starting point is not among the terms in play.
+
+Include at least one of the second kind if one genuinely exists. Do not
+invent one to satisfy this instruction; say plainly that you could find
+none, which is itself informative. Be aware that the second kind is harder
+for you to surface precisely because the frame on the page shapes what
+comes to mind.
+
+Return ONLY a single JSON object, and nothing else -- no preamble, no
+markdown code fence. Exactly two keys:
+
+  "frame": the one-or-two-sentence statement described above.
+  "recommendations": an array of objects, each with "name" (short label,
+    no spaces -- use underscores), "note" (ONE line: what position it
+    holds on this question), "kind" ("within" or "questions_the_frame"),
+    and "why" (ONE line: what it would do to THIS exchange specifically).
+""".strip()
+
+
+def build_recommender_prompt(question, turns, candidates=None,
+                             count=3, instructions=None):
+    if instructions is None:
+        instructions = RECOMMENDER_INSTRUCTIONS
+
+    if candidates:
+        listed = "\n".join(f"- {c['name']}: {c['note']}" for c in candidates)
+        source = (
+            f"\nRecommend ONLY from this list, which was produced before the "
+            f"dialogue began:\n{listed}\n\n"
+            f"Use these names verbatim. This list predates the frame the "
+            f"dialogue has since settled into, which is the reason for using "
+            f"it -- it is not shaped by where the exchange has gone.\n")
+    else:
+        source = ("\nRecommend from anywhere. Nothing constrains you to "
+                  "perspectives considered earlier.\n")
+
+    return (
+        f'The dialogue question is: "{question}"\n\n'
+        f"The exchange so far:\n\n{render_transcript(turns)}\n"
+        f"{source}\n"
+        f"Recommend about {count} perspectives.\n\n{instructions}\n"
+    )
+
+
+def recommend_perspectives(question, turns, candidates=None, count=3, model=None,
+                           instructions=None, max_tokens=DEFAULT_GENERATOR_MAX_TOKENS,
+                           effort=None):
+    """
+    Returns {"frame": str, "recommendations": [{"name","note","kind","why"}]}.
+
+    Pass `candidates` (the dialogue's stored sweep) to restrict to material
+    chosen before the frame set; omit it to retrieve fresh.
+
+    Not an Observer function, deliberately. The Observer reads the record
+    and could plainly do this, but its persona states it has no authority
+    to direct and that naming is the whole job -- recommending who should
+    join is directing. Separate call, separate instrument.
+    """
+    if model is None:
+        model = PERSPECTIVE_GENERATOR_MODEL
+    if not turns:
+        raise ValueError("Nothing to recommend against -- the dialogue is empty.")
+
+    prompt = build_recommender_prompt(question, turns, candidates=candidates,
+                                      count=count, instructions=instructions)
+    raw = _strip_code_fence(
+        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort))
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Recommender did not return valid JSON: {e}\n"
+                         f"Raw response was:\n{raw}")
+
+    if not isinstance(parsed, dict) or "recommendations" not in parsed:
+        raise ValueError(f"Recommender response missing 'recommendations': {parsed!r}")
+
+    recs = []
+    for item in parsed["recommendations"]:
+        if not isinstance(item, dict) or "name" not in item:
+            continue
+        kind = item.get("kind")
+        recs.append({
+            "name": item["name"],
+            "note": item.get("note", ""),
+            "kind": kind if kind in ("within", "questions_the_frame") else "within",
+            "why": item.get("why", ""),
+        })
+
+    return {"frame": parsed.get("frame", ""), "recommendations": recs}
 
 
 # --- Both passes together ---------------------------------------------------
@@ -1032,9 +1560,10 @@ def generate_perspectives(question, count=DEFAULT_PERSPECTIVE_COUNT,
     passes so the app can show the full candidate list with the selections
     marked -- which is the point of splitting them.
 
-        {"perspectives": [...], "rationale": str, "near_misses": [...],
-         "added_outside_sweep": [...], "candidates": [...],
-         "default_slate": [...], "what_the_default_excludes": str}
+        {"perspectives": [...], "rationale": str, "tensions": [...],
+         "near_misses": [...], "added_outside_sweep": [...],
+         "candidates": [...], "default_slate": [...],
+         "what_the_default_excludes": str}
 
     Two API calls. Callers wanting to show the sweep before committing to a
     selection should call sweep_candidates and select_perspectives directly.
@@ -1221,50 +1750,111 @@ def refine_perspectives(question, current_perspectives, history, latest_message,
 
 
 # ---------------------------------------------------------------------------
-# CURIOSITY TALLY
+# ENGAGEMENT TALLY
 #
-# Free by-product of the roster block: who gets nominated, by whom. A
-# signal about where each agent thinks the live tension is, and cheaper to
-# read than the content of the requests.
+# Who is addressing whom. Three separate signals, kept separate because
+# they mean different things:
 #
-# Deliberately crude -- a name match in a turn's body. It will over-count
-# (an agent mentioned in passing counts) and it can't tell a nomination
-# from a criticism. Good enough for "who never gets named at all," which is
-# the reading that's actually hard to get from a straight read-through.
-# Not a measurement; a pointer to transcripts worth reading.
+#   named    -- an agent used another participant's name. This is the
+#               behavior CURIOSITY_INSTRUCTION actually asks for.
+#   quoted   -- an agent reproduced a run of another participant's earlier
+#               words without naming them. Directed engagement that
+#               name-matching alone misses entirely.
+#   early    -- a name used before that participant had taken any turn.
+#               AMBIGUOUS BY CONSTRUCTION, and deliberately not resolved
+#               here. It is either a forward-looking nomination ("I would
+#               want to push on that with X"), which is exactly the
+#               behavior the roster block is for, or a false attribution
+#               ("X has pressed on..."), which is the roster-description
+#               bug. Both name a participant who has not spoken; the
+#               difference is attributing a past speech act versus
+#               requesting a future one, and no reliable mechanical test
+#               separates them. Treat every entry as a turn to go read.
+#
+# The first version counted only `named` and called the result "who never
+# gets named." In the first real dialogue one agent put a question to
+# another by quoting it without using its name, and the tally recorded
+# nothing -- so an agent can be the most engaged-with participant in a
+# dialogue and appear to have been ignored. `quoted` exists for that.
+#
+# Still crude. A name in a turn counts however it was used, so a criticism
+# scores the same as an invitation, and quotation matching cannot tell
+# agreement from rebuttal. This points at transcripts worth reading. It is
+# not a measurement.
 # ---------------------------------------------------------------------------
 
-def curiosity_tally(turns, agents, humans=()):
+import re as _re
+
+_WORD = _re.compile(r"[a-z0-9]+")
+DEFAULT_QUOTE_NGRAM = 7
+
+
+def _words(text):
+    return _WORD.findall((text or "").lower())
+
+
+def _ngrams(words, n):
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)} if len(words) >= n else set()
+
+
+def engagement_tally(turns, agents, humans=(), quote_ngram=DEFAULT_QUOTE_NGRAM):
     """
-    Returns {speaker: {mentioned_name: count}} over agent-authored turns.
-    Human turns are excluded -- their routing is explicit in `addressee`
-    and is a different thing from an agent's spontaneous interest.
+    Returns {"named": {...}, "quoted": {...}, "early": [...]}.
+
+    `named` and `quoted` are {speaker: {target: count}} over agent-authored
+    turns only. Human turns are excluded -- their routing is explicit in
+    `addressee`, which is a different thing from an agent's own interest.
+
+    `early` is a list of (speaker, target, turn_index) where an agent named
+    a participant that had not yet taken a turn. Ambiguous between a
+    forward-looking nomination and a false attribution -- see the note
+    above. A pointer to a turn worth reading, not a defect count.
     """
     agent_names = {a["name"] for a in agents}
     all_names = agent_names | set(humans)
     human_set = set(humans)
 
-    tally = {}
-    for t in turns:
+    named, quoted, early = {}, {}, []
+    seen = set()          # who has spoken, as of each turn
+    prior = []            # (speaker, ngrams) for turns already passed
+
+    for idx, t in enumerate(turns):
         speaker = t["speaker"]
-        if speaker in human_set or speaker not in agent_names:
-            continue
         body = t.get("body") or ""
-        for name in all_names:
-            if name == speaker:
-                continue
-            if name in body:
-                tally.setdefault(speaker, {})
-                tally[speaker][name] = tally[speaker].get(name, 0) + 1
-    return tally
+
+        if speaker not in human_set and speaker in agent_names:
+            # -- explicit naming --
+            for name in all_names:
+                if name == speaker or name not in body:
+                    continue
+                named.setdefault(speaker, {})
+                named[speaker][name] = named[speaker].get(name, 0) + 1
+                if name not in seen:
+                    early.append((speaker, name, idx))
+
+            # -- quotation of someone's earlier words, without naming them --
+            mine = _ngrams(_words(body), quote_ngram)
+            if mine:
+                for other, theirs in prior:
+                    if other == speaker or other in body:
+                        continue  # naming it already counted above
+                    if mine & theirs:
+                        quoted.setdefault(speaker, {})
+                        quoted[speaker][other] = quoted[speaker].get(other, 0) + 1
+
+        prior.append((speaker, _ngrams(_words(body), quote_ngram)))
+        seen.add(speaker)
+
+    return {"named": named, "quoted": quoted, "early": early}
 
 
-def never_named(turns, agents, humans=()):
+def never_engaged(turns, agents, humans=(), quote_ngram=DEFAULT_QUOTE_NGRAM):
     """
-    Perspective agents nobody mentioned. Either genuinely peripheral to the
-    question, or being treated as peripheral -- different things, and
-    distinguishable only by reading what they actually said.
+    Perspective agents nobody named OR quoted. Weaker than it looks: an
+    agent can be engaged with through paraphrase that neither names nor
+    reproduces its words, and this will still miss that.
     """
-    tally = curiosity_tally(turns, agents, humans=humans)
-    mentioned = {name for counts in tally.values() for name in counts}
-    return [a["name"] for a in perspective_agents(agents) if a["name"] not in mentioned]
+    tally = engagement_tally(turns, agents, humans=humans, quote_ngram=quote_ngram)
+    reached = {n for counts in tally["named"].values() for n in counts}
+    reached |= {n for counts in tally["quoted"].values() for n in counts}
+    return [a["name"] for a in perspective_agents(agents) if a["name"] not in reached]

@@ -22,7 +22,9 @@ participant: id, schema_version, display_name, app_token, created_at
 agent:       id, schema_version, name, persona, description, kind,
              visibility, created_by, source_question, created_at
 dialogue:    id, schema_version, title, question, agents (embedded list),
-             sweep (dict or None), created_by, created_at
+             sweep (dict or None), selection (dict or None: rationale,
+             tensions, near_misses), reference (dict or None: text,
+             files), created_by, created_at
 turn:        id, dialogue_id, seq, speaker, body, addressee, author_id,
              created_at
 
@@ -68,7 +70,8 @@ class Storage:
     def delete_agent(self, agent_id): raise NotImplementedError
 
     # -- dialogues --
-    def create_dialogue(self, title, question, agents, created_by, sweep=None): raise NotImplementedError
+    def create_dialogue(self, title, question, agents, created_by, sweep=None,
+                        selection=None, reference=None): raise NotImplementedError
     def get_dialogue(self, dialogue_id): raise NotImplementedError
     def list_dialogues(self, created_by=None): raise NotImplementedError
     def update_dialogue(self, dialogue_id, **fields): raise NotImplementedError
@@ -182,7 +185,8 @@ class JsonStorage(Storage):
             return False
 
     # -- dialogues --
-    def create_dialogue(self, title, question, agents, created_by, sweep=None):
+    def create_dialogue(self, title, question, agents, created_by, sweep=None,
+                        selection=None, reference=None):
         rec = {
             "id": new_id(),
             "schema_version": SCHEMA_VERSION,
@@ -190,6 +194,8 @@ class JsonStorage(Storage):
             "question": question,
             "agents": agents,
             "sweep": sweep,
+            "selection": selection,
+            "reference": reference,
             "created_by": created_by,
             "created_at": now(),
         }
@@ -288,10 +294,17 @@ CREATE TABLE IF NOT EXISTS dialogues (
     question        TEXT NOT NULL,
     agents          JSONB NOT NULL,
     sweep           JSONB,
+    selection       JSONB,
+    reference       JSONB,
     created_by      UUID,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS dialogues_created_by_idx ON dialogues (created_by);
+
+-- Idempotent, and the upgrade path for a database created before `selection`
+-- existed. init_schema() can be re-run safely on a live database.
+ALTER TABLE dialogues ADD COLUMN IF NOT EXISTS selection JSONB;
+ALTER TABLE dialogues ADD COLUMN IF NOT EXISTS reference JSONB;
 
 CREATE TABLE IF NOT EXISTS turns (
     id              UUID PRIMARY KEY,
@@ -318,7 +331,16 @@ class PostgresStorage(Storage):
         self.dsn = dsn
 
     def _conn(self):
-        return self._psycopg.connect(self.dsn, row_factory=self._dict_row)
+        # prepare_threshold=None disables psycopg's automatic prepared
+        # statements. Neon's pooled endpoint (and any PgBouncer in
+        # transaction mode) doesn't support prepared statements across
+        # transactions, and psycopg starts preparing after a query repeats
+        # on the same connection. Harmless today -- each connection here
+        # runs one or two queries and closes, never reaching the threshold
+        # -- but it becomes a live bug the moment connections get reused,
+        # and the failure is confusing when it arrives.
+        return self._psycopg.connect(self.dsn, row_factory=self._dict_row,
+                                     prepare_threshold=None)
 
     def init_schema(self):
         with self._conn() as c, c.cursor() as cur:
@@ -403,15 +425,19 @@ class PostgresStorage(Storage):
         return deleted
 
     # -- dialogues --
-    def create_dialogue(self, title, question, agents, created_by, sweep=None):
+    def create_dialogue(self, title, question, agents, created_by, sweep=None,
+                        selection=None, reference=None):
         from psycopg.types.json import Jsonb
         with self._conn() as c, c.cursor() as cur:
             cur.execute(
                 """INSERT INTO dialogues (id, schema_version, title, question,
-                                          agents, sweep, created_by)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                                          agents, sweep, selection, reference,
+                                          created_by)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
                 (new_id(), SCHEMA_VERSION, title, question,
-                 Jsonb(agents), Jsonb(sweep) if sweep else None, created_by),
+                 Jsonb(agents), Jsonb(sweep) if sweep else None,
+                 Jsonb(selection) if selection else None,
+                 Jsonb(reference) if reference else None, created_by),
             )
             row = cur.fetchone()
             c.commit()
@@ -433,13 +459,13 @@ class PostgresStorage(Storage):
 
     def update_dialogue(self, dialogue_id, **fields):
         from psycopg.types.json import Jsonb
-        allowed = {"title", "question", "agents", "sweep"}
+        allowed = {"title", "question", "agents", "sweep", "selection", "reference"}
         sets, vals = [], []
         for k, v in fields.items():
             if k not in allowed:
                 raise ValueError(f"Cannot update field {k!r}")
             sets.append(f"{k} = %s")
-            vals.append(Jsonb(v) if k in ("agents", "sweep") else v)
+            vals.append(Jsonb(v) if k in ("agents", "sweep", "selection", "reference") else v)
         vals.append(dialogue_id)
         with self._conn() as c, c.cursor() as cur:
             cur.execute(f"UPDATE dialogues SET {', '.join(sets)} WHERE id = %s RETURNING *", vals)
@@ -521,10 +547,13 @@ def migrate_json_to_postgres(json_root, dsn, verbose=True):
         with dst._conn() as c, c.cursor() as cur:
             cur.execute(
                 """INSERT INTO dialogues (id, schema_version, title, question,
-                                          agents, sweep, created_by, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                          agents, sweep, selection, reference,
+                                          created_by, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (d["id"], d.get("schema_version", SCHEMA_VERSION), d["title"], d["question"],
                  Jsonb(d["agents"]), Jsonb(d["sweep"]) if d.get("sweep") else None,
+                 Jsonb(d["selection"]) if d.get("selection") else None,
+                 Jsonb(d["reference"]) if d.get("reference") else None,
                  d.get("created_by"), d["created_at"]),
             )
             c.commit()
