@@ -52,6 +52,13 @@ DEFAULT_TURN_MAX_TOKENS = 4000
 DEFAULT_MODERATOR_MAX_TOKENS = 3000
 DEFAULT_SUMMARY_MAX_TOKENS = 5000
 DEFAULT_GENERATOR_MAX_TOKENS = 4000
+
+# write_personas returns every persona in ONE call so they are composed with
+# awareness of each other. That makes its output scale with roster size, and
+# a fixed ceiling silently truncates the JSON partway through the last entry.
+# Observed: seven personas ran to roughly 6,500 tokens against a 4,000 budget.
+PERSONA_TOKENS_EACH = 1200
+PERSONA_TOKENS_BASE = 1000
 DEFAULT_REFINER_MAX_TOKENS = 4000
 
 # Reference material is prepended to every perspective agent's system
@@ -1190,17 +1197,7 @@ def sweep_candidates(question, count=DEFAULT_SWEEP_COUNT, model=None,
         model = PERSPECTIVE_GENERATOR_MODEL
 
     prompt = build_sweep_prompt(question, count, instructions)
-    raw = _strip_code_fence(
-        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort)
-    )
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Perspective sweep did not return valid JSON: {e}\n"
-            f"Raw response was:\n{raw}"
-        )
+    parsed = _json_call(model, "", prompt, max_tokens, effort, "Perspective sweep")
 
     if not isinstance(parsed, dict) or "candidates" not in parsed:
         raise ValueError(f"Sweep response missing 'candidates': {parsed!r}")
@@ -1300,14 +1297,7 @@ def choose_perspectives(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
         model = PERSPECTIVE_GENERATOR_MODEL
 
     prompt = build_choice_prompt(question, candidates, count, instructions)
-    raw = _strip_code_fence(
-        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort))
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Perspective choice did not return valid JSON: {e}\n"
-                         f"Raw response was:\n{raw}")
+    parsed = _json_call(model, "", prompt, max_tokens, effort, "Perspective choice")
 
     if not isinstance(parsed, dict) or "chosen" not in parsed:
         raise ValueError(f"Choice response missing 'chosen': {parsed!r}")
@@ -1378,8 +1368,7 @@ def build_persona_writer_prompt(question, chosen, candidates=None, tensions=None
 
 
 def write_personas(question, chosen, candidates=None, tensions=None, model=None,
-                   instructions=None, max_tokens=DEFAULT_GENERATOR_MAX_TOKENS,
-                   effort=None):
+                   instructions=None, max_tokens=None, effort=None):
     """
     Pass 2b -- full persona and description for an agreed slate, all in one
     call so they are composed with awareness of each other.
@@ -1388,18 +1377,14 @@ def write_personas(question, chosen, candidates=None, tensions=None, model=None,
     """
     if model is None:
         model = PERSPECTIVE_GENERATOR_MODEL
+    if max_tokens is None:
+        # Scales with roster size -- see PERSONA_TOKENS_EACH. A fixed
+        # ceiling truncates the JSON partway through the last persona.
+        max_tokens = PERSONA_TOKENS_BASE + PERSONA_TOKENS_EACH * max(len(chosen), 1)
 
     prompt = build_persona_writer_prompt(question, chosen, candidates=candidates,
                                          tensions=tensions, instructions=instructions)
-    raw = _strip_code_fence(
-        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort))
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Persona writer did not return valid JSON: {e}\n"
-                         f"Raw response was:\n{raw}")
-
+    parsed = _json_call(model, "", prompt, max_tokens, effort, "Persona writer")
     return _parse_perspective_list(parsed)
 
 
@@ -1416,8 +1401,7 @@ def select_perspectives(question, candidates, count=DEFAULT_PERSPECTIVE_COUNT,
     choice = choose_perspectives(question, candidates, count=count, model=model,
                                  max_tokens=max_tokens, effort=effort)
     agents = write_personas(question, choice["chosen"], candidates=candidates,
-                            tensions=choice["tensions"], model=model,
-                            max_tokens=max_tokens, effort=effort)
+                            tensions=choice["tensions"], model=model, effort=effort)
     return {"perspectives": agents,
             **{k: choice[k] for k in ("rationale", "tensions", "near_misses",
                                       "added_outside_sweep")}}
@@ -1523,14 +1507,7 @@ def recommend_perspectives(question, turns, candidates=None, count=3, model=None
 
     prompt = build_recommender_prompt(question, turns, candidates=candidates,
                                       count=count, instructions=instructions)
-    raw = _strip_code_fence(
-        call_model(model, "", prompt, max_tokens=max_tokens, effort=effort))
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Recommender did not return valid JSON: {e}\n"
-                         f"Raw response was:\n{raw}")
+    parsed = _json_call(model, "", prompt, max_tokens, effort, "Recommender")
 
     if not isinstance(parsed, dict) or "recommendations" not in parsed:
         raise ValueError(f"Recommender response missing 'recommendations': {parsed!r}")
@@ -1615,6 +1592,33 @@ Never return a partial list containing only the entries that changed --
 always return the complete current slate on any turn where you return one
 at all.
 """.strip()
+
+
+def _json_call(model, system_prompt, prompt, max_tokens, effort, what):
+    """
+    Call the model expecting JSON, and fail with a message that names the
+    actual problem.
+
+    Truncation is the failure mode that matters here: a response cut off at
+    max_tokens is invalid JSON, and reporting it as a parse error sends
+    anyone debugging it looking at the prompt instead of the budget. The
+    API tells us directly via stop_reason, so read it.
+    """
+    raw, truncated = call_model_with_meta(model, system_prompt, prompt,
+                                          max_tokens=max_tokens, effort=effort)
+    if truncated:
+        raise ValueError(
+            f"{what} ran out of room -- the response hit the {max_tokens:,}-token "
+            f"ceiling and was cut off mid-JSON. Raise max_tokens (or ask for "
+            f"fewer items) and try again. Nothing was saved."
+        )
+
+    raw = _strip_code_fence(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{what} did not return valid JSON: {e}\n"
+                         f"Raw response was:\n{raw}")
 
 
 def _strip_code_fence(raw):
@@ -1712,7 +1716,7 @@ def build_perspective_refiner_prompt(question, current_perspectives, history,
 
 def refine_perspectives(question, current_perspectives, history, latest_message,
                         count_hint=None, candidates=None, model=None,
-                        max_tokens=DEFAULT_GENERATOR_MAX_TOKENS, effort=None):
+                        max_tokens=None, effort=None):
     """
     One turn of the perspective-refinement chat. Returns
     {"reply": str, "perspectives": list|None} -- perspectives is None when
@@ -1722,22 +1726,16 @@ def refine_perspectives(question, current_perspectives, history, latest_message,
     if model is None:
         model = PERSPECTIVE_GENERATOR_MODEL
 
+    if max_tokens is None:
+        n = len(current_perspectives or []) or count_hint or DEFAULT_PERSPECTIVE_COUNT
+        max_tokens = PERSONA_TOKENS_BASE + PERSONA_TOKENS_EACH * n
+
     prompt = build_perspective_refiner_prompt(
         question, current_perspectives, history, latest_message,
         count_hint=count_hint, candidates=candidates,
     )
-    raw = _strip_code_fence(
-        call_model(model, PERSPECTIVE_REFINER_SYSTEM_PROMPT, prompt,
-                   max_tokens=max_tokens, effort=effort)
-    )
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Perspective refiner did not return valid JSON: {e}\n"
-            f"Raw response was:\n{raw}"
-        )
+    parsed = _json_call(model, PERSPECTIVE_REFINER_SYSTEM_PROMPT, prompt,
+                        max_tokens, effort, "Perspective refiner")
 
     if not isinstance(parsed, dict) or "reply" not in parsed:
         raise ValueError(f"Perspective refiner response missing 'reply': {parsed!r}")
